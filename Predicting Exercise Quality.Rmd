@@ -1,0 +1,183 @@
+---
+title: "Predicting exercise quality using Machine Learning"
+author: "Coursera Student"
+date: "18 November 2015"
+output: html_document
+---
+
+# Executive summary
+
+The goal of this paper is to explain how machine learning could be used to accurately predict the manner in which subjects performed an exercise. This would improve the quality of physical activity and result in added health benefits.  
+
+Given the primary objective is thus accuracy a Random Forest (RF) model was built, which is also robust to variance and bias. 
+
+RF modelling has no need for cross-validation for unbiased estimates due to it being estimated internally during the run. That said, Coursera's explicit requirements include cross validation so a random test set will be generated and the model evaluated for accuracy by estimating an out of sample error rate. 
+
+The result was > 99% accuracy in both the test (as randomly generated) and prediction (as submitted to Coursera) sets.
+
+Note the paper was not written to be reproducible given an .RMD file is included in this github repository showing all relevant code.
+
+# Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behaviour, or because they are tech geeks. 
+
+One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. Thus we'll use data from accelerometers on the belt, forearm, arm, and dumbbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. 
+
+More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+
+```{r, echo = F, warning = F, message=F}
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(fBasics)
+library(corrplot)
+library(randomForest)
+library(doMC)
+registerDoMC(cores = 2)
+set.seed(123)
+```
+
+
+# Data sourcing
+
+Training and Prediction (not test) data was downloaded from the following URL: https://d396qusza40orc.cloudfront.net/predmachlearn/ . The dimensions are shown below.
+
+```{r, echo=F, cache = TRUE}
+raw <- read.table('pml-training.csv', header = TRUE, sep = ',', na.strings = c("NA","","#DIV/0!","0.00"), stringsAsFactors = T)
+
+prediction <- read.table('pml-testing.csv', header = TRUE, sep = ',', na.strings = c("NA","","#DIV/0!","0.00"), stringsAsFactors = T)
+```
+
+```{r}
+dim(raw)
+dim(prediction)
+```
+
+# Data exploration
+
+The below plot shows exercise classe (to be predicted), subject and a random measure over a standardised time variable. Also included is the new_window variable to see if window variables are of importance (seems not, but may be reconsidered if accuracy is low).
+
+```{r, fig.height=10, fig.width = 14}
+ggplot(data = raw, aes(x=raw_timestamp_part_2,y=pitch_forearm,col = new_window)) + geom_line() + facet_grid(user_name ~ classe)
+
+```
+
+# Data cleaning
+
+To allow optimal running time with limited resource (old computer) and reduced variance we remove redundant variables from both source and prediction data sets:
+
+* missing values for more than 95% of observations
+* low information value i.e. nearZeroVar is True
+* line identification variables
+* date stamps and window indicators as raw timestamps will be used instead
+
+```{r, echo = T, cache = TRUE}
+# Missing values
+prepared <- raw[, colSums(is.na(raw)) < nrow(raw)*.95]
+prediction <- prediction[, colSums(is.na(raw)) < nrow(raw)*.95]
+# Low information value
+nzv <- nearZeroVar(prepared, saveMetrics = F)
+prepared <- prepared[,-nzv]
+prediction <- prediction[,-nzv]
+# IDs, dates and window variables
+prepared <- prepared[,-c(1,5:7)]
+prediction <- prediction[,-c(1,5:7)]
+# Review new dimensions
+dim(prepared)
+dim(prediction)
+```
+
+# Testing for highly correlated variables
+
+Per the below ordered plot there are only a few highly correlated variables and thus combining and elimination through for example Principle Component Analysis (PCA) is not considered necessary. 
+
+```{r echo = F, fig.width = 10, fig.height = 14}
+corl <- cor(prepared[sapply(prepared,is.numeric)], use="pairwise", method="pearson")
+ord <- order(corl[1,])
+corl <- corl[ord, ord]
+corrplot(corl, mar=c(0,0,1,0))
+title(main="Correlation prepared using Pearson")
+```
+
+# Skew and kurtosis
+
+Below shows kurtosis for each numeric variable of the dataset. Larger values mean sharper peaks and flatter tails. Positive values indicate an acute peak around the mean. Negative values indicate a smaller peak around the mean. 
+
+```{r, echo = F}
+kurtosis(prepared[sapply(prepared,is.numeric)], na.rm = T)
+```
+
+Below shows skewness for each numeric variable of the dataset with positives indicating longer right tails. The data seems fairly normally distributed thus pre-processing such as log transformation is not considered necessary.
+
+```{r, echo = F}
+skewness(prepared[sapply(prepared,is.numeric)], na.rm = T)
+```
+
+# Building a Random Forrest model
+
+## Holding out an evaluation set
+
+Per project requirements a test set is being randomly selected to evaluate the model against. Given the large amount of observations a 60% training : 40% test split is considered appropriate. The dimensions of the two data sets are shown below.
+
+```{r, echo = F}
+inTrain <- createDataPartition(y=prepared$classe,p=0.60, list=FALSE) 
+training <- prepared[inTrain,]
+test <- prepared[-inTrain,]
+```
+
+```{r}
+dim(training)
+dim(test)
+```
+
+## Setting tuning parameters
+
+Given the data is time series based a 'Timeslice' control parameter is created to be passed to the modelling function for cross validation purposes during the running of the model.
+
+```{r, echo=TRUE}
+
+fitControl2 <- trainControl(method='timeslice', initialWindow=120, fixedWindow=TRUE, horizon=120)
+
+```
+
+## Train a random forrest model 
+
+Per the below our estimated out of sample error rate (OOB) is 0.36%, which is considered sufficient for our stated purpose.
+
+```{r, echo = F, warning=F, cache = TRUE}
+
+modelFit <- randomForest::randomForest(classe ~ .,
+                                     data=training, 
+                                     ntree=100,
+                                     mtry=7,
+                                     importance=TRUE,
+                                     na.action=randomForest::na.roughfix,
+                                     replace=FALSE, 
+                                     allowparallel = T,
+                                     trControl = fitControl2)
+modelFit
+```
+
+## Estimating the error using cross-validation
+
+The test set is passed to the newly created RF model and results are analysed in a confusion matrix. Accuracy is given as 99.78%, thus the expect out of sample error is 0.22%. 
+
+The plot shows that a sufficient number of trees have been constructed (100) and additional trees would not significantly reduce the observed error rate.
+
+```{r, echo = F, fig.width = 14, fig.height = 10}
+confusionMatrix(test$classe,predict(modelFit,test[,-55]) )
+plot(modelFit, main="")
+legend("topright", c("OOB", "A", "B", "C", "D", "E"), text.col=1:6, lty=1:3, col=1:3)
+title(main="Error Rates Random Forest")
+```
+
+## Predicitng exercise classes for submission to Coursera
+
+The model is applied to the prediction data set as loaded earlier. The below results gave 100% accuracy per Coursera's online evaluation.
+
+```{r}
+predict(modelFit,prediction[,-55])
+```
+
+
